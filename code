@@ -1,0 +1,251 @@
+""" terminal calendar :3 u can add, edit and delete events
+events are stored in json ~/.config/caluwu/events.json
+runs without ext dependencies, just stdlib
+(uses terminal colors)
+"""
+
+import curses
+import calendar
+import json
+from datetime import datetime, date, timedelta
+from pathlib import Path
+import locale
+import sys
+
+locale.setlocale(locale.LC_ALL, '')
+
+CONFIG_DIR = Path.home() / '.config' / 'caluwu'
+EVENTS_FILE = CONFIG_DIR / 'events.json'
+
+
+class EventStore:
+    def __init__(self, path=EVENTS_FILE):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.events = {}
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    self.events = json.load(f)
+            except Exception:
+                self.events = {}
+        else:
+            self.events = {}
+
+    def save(self):
+        try:
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.events, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print('Failed to save events:', e, file=sys.stderr)
+
+    def get(self, d: date):
+        return self.events.get(d.isoformat(), [])
+
+    def add(self, d: date, title: str, time: str = ''):
+        key = d.isoformat()
+        self.events.setdefault(key, []).append({'title': title, 'time': time})
+        self.save()
+
+    def update(self, d: date, idx: int, title: str, time: str = ''):
+        key = d.isoformat()
+        self.events[key][idx] = {'title': title, 'time': time}
+        self.save()
+
+    def delete(self, d: date, idx: int):
+        key = d.isoformat()
+        try:
+            self.events[key].pop(idx)
+            if not self.events[key]:
+                del self.events[key]
+            self.save()
+        except Exception:
+            pass
+
+    def search(self, q: str):
+        q = q.lower()
+        out = []
+        for k, items in self.events.items():
+            for i, ev in enumerate(items):
+                if q in ev.get('title', '').lower():
+                    out.append((k, i, ev))
+        return out
+
+
+class CaluWu:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_WHITE, -1)        
+        curses.init_pair(2, curses.COLOR_MAGENTA, -1)     
+        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_MAGENTA) 
+        curses.init_pair(4, curses.COLOR_MAGENTA, -1)     
+        curses.init_pair(5, curses.COLOR_CYAN, -1)        
+
+        self.color_default = curses.color_pair(1)
+        self.color_pink = curses.color_pair(2)
+        self.color_selected = curses.color_pair(3)
+        self.color_today = curses.color_pair(4) | curses.A_BOLD
+        self.color_secondary = curses.color_pair(5)
+
+        self.height, self.width = self.stdscr.getmaxyx()
+        self.today = date.today()
+        self.curr_year = self.today.year
+        self.curr_month = self.today.month
+        self.sel_day = self.today.day
+        self.cal = calendar.Calendar(firstweekday=calendar.MONDAY)
+        self.store = EventStore()
+        self.msg = ''
+
+    def run(self):
+        while True:
+            self.stdscr.clear()
+            self.height, self.width = self.stdscr.getmaxyx()
+            try:
+                self.draw()
+                c = self.stdscr.getch()
+                if not self.handle_key(c):
+                    break
+            except KeyboardInterrupt:
+                break
+
+    def draw(self):
+        title = f"CaluWu — {self.curr_year}-{self.curr_month:02d}"
+        self.stdscr.addstr(0, 2, title, self.color_pink | curses.A_BOLD)
+        help_line = "[←/→] month [w/a/s/d] move [+] add [v] view [f] search [t] today [q] quit"
+        self.stdscr.addstr(0, self.width - len(help_line) - 2, help_line, self.color_secondary)
+
+        month_days = list(self.cal.itermonthdays(self.curr_year, self.curr_month))
+        weeks = [month_days[i:i+7] for i in range(0, len(month_days), 7)]
+        start_row = 2
+
+        wd_names = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su']
+        for i, wd in enumerate(wd_names):
+            x = 4 + i * 10
+            self.stdscr.addstr(start_row, x, wd, self.color_pink | curses.A_UNDERLINE)
+
+        for r, week in enumerate(weeks):
+            for c_idx, daynum in enumerate(week):
+                x = 2 + c_idx * 10
+                y = start_row + 2 + r * 2
+                if daynum == 0:
+                    continue
+                d = date(self.curr_year, self.curr_month, daynum)
+                evs = self.store.get(d)
+                mark = '*' if evs else ' '
+                attr = self.color_default
+                if daynum == self.sel_day:
+                    attr = self.color_selected
+                elif d == self.today:
+                    attr = self.color_today
+                self.stdscr.addstr(y, x, f" {daynum:2d}{mark}", attr)
+
+        sel_date = date(self.curr_year, self.curr_month, self.sel_day)
+        footer_y = start_row + 2 + len(weeks) * 2 + 1
+        evs = self.store.get(sel_date)
+        self.stdscr.addstr(footer_y, 2, f"Events on {sel_date.isoformat()}: ", self.color_pink)
+        if not evs:
+            self.stdscr.addstr(footer_y, 30, "(none)", self.color_secondary)
+        else:
+            for i, ev in enumerate(evs[:3]):
+                line = f"  {i+1}. {ev.get('time','')} {ev.get('title','')}"
+                self.stdscr.addstr(footer_y + i + 1, 4, line, self.color_default)
+
+        if self.msg:
+            self.stdscr.addstr(self.height - 2, 2, self.msg, self.color_secondary)
+        self.stdscr.refresh()
+
+    def handle_key(self, c):
+        if c in (curses.KEY_LEFT,):
+            self.prev_month()
+        elif c in (curses.KEY_RIGHT,):
+            self.next_month()
+        elif c in (ord('q'), ord('Q')):
+            return False
+        elif c in (ord('t'),):
+            self.goto_today()
+        elif c in (ord('a'),):
+            self.move(-1)
+        elif c in (ord('d'),):
+            self.move(1)
+        elif c in (ord('w'),):
+            self.move(-7)
+        elif c in (ord('s'),):
+            self.move(7)
+        elif c in (ord('+'),):
+            self.add_event_flow()
+        elif c in (ord('\n'), ord('v'), ord('V')):
+            self.view_events_flow()
+        elif c in (ord('f'),):
+            self.search_flow()
+        return True
+
+    def prev_month(self):
+        self.curr_month -= 1
+        if self.curr_month < 1:
+            self.curr_month = 12
+            self.curr_year -= 1
+
+    def next_month(self):
+        self.curr_month += 1
+        if self.curr_month > 12:
+            self.curr_month = 1
+            self.curr_year += 1
+
+    def goto_today(self):
+        self.curr_year, self.curr_month, self.sel_day = self.today.year, self.today.month, self.today.day
+
+    def move(self, delta):
+        cur = date(self.curr_year, self.curr_month, self.sel_day)
+        new = cur + timedelta(days=delta)
+        self.curr_year, self.curr_month, self.sel_day = new.year, new.month, new.day
+
+    def prompt(self, prompt_text):
+        curses.echo()
+        self.stdscr.addstr(self.height - 2, 2, prompt_text + ": ", self.color_pink)
+        inp = self.stdscr.getstr(self.height - 2, len(prompt_text) + 4, 200)
+        curses.noecho()
+        try:
+            return inp.decode('utf-8').strip()
+        except Exception:
+            return ''
+
+    def add_event_flow(self):
+        sel = date(self.curr_year, self.curr_month, self.sel_day)
+        title = self.prompt(f"Add event on {sel}")
+        if not title:
+            self.msg = "Cancelled."
+            return
+        time = self.prompt("Time (HH:MM optional)")
+        self.store.add(sel, title, time)
+        self.msg = "Event added"
+
+    def view_events_flow(self):
+        sel = date(self.curr_year, self.curr_month, self.sel_day)
+        evs = self.store.get(sel)
+        if not evs:
+            self.msg = "No events today."
+            return
+        self.msg = f"{len(evs)} events today."
+
+    def search_flow(self):
+        q = self.prompt("Search term")
+        if not q:
+            self.msg = "Cancelled."
+            return
+        results = self.store.search(q)
+        self.msg = f"{len(results)} result(s)."
+
+
+def main(stdscr):
+    app = CaluWu(stdscr)
+    app.run()
+
+
+if __name__ == '__main__':
+    curses.wrapper(main)
